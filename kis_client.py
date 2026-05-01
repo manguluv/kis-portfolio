@@ -1,5 +1,6 @@
 import os
 import requests
+import yfinance as yf
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -65,8 +66,20 @@ def fetch_domestic(token):
         raise RuntimeError(f"국내주식 조회 실패: [{data.get('msg_cd')}] {data.get('msg1', '').strip()}")
     return data
 
-def fetch_overseas(token, ovrs_excg_cd="ALL", tr_crcy_cd="USD"):
-    """해외주식 잔고 조회. ovrs_excg_cd: NASD(미국전체)/NYSE/AMEX 등. ALL일 경우 전체 조회."""
+def get_exchange_rate(tr_crcy_cd="USD"):
+    """yfinance를 이용한 실시간 환율 조회 (USD -> KRW)"""
+    try:
+        # KRW=X ticker는 Yahoo Finance에서 USD/KRW 환율을 의미
+        ticker = yf.Ticker("KRW=X")
+        hist = ticker.history(period="1d")
+        if not hist.empty:
+            return float(hist['Close'].iloc[-1])
+    except Exception as e:
+        print(f"[경고] yfinance 환율 조회 실패: {e}. 기본 환율 1,350원 적용.")
+    return 1350.0
+
+def fetch_overseas(token, ovrs_excg_cd="NASD", tr_crcy_cd="USD"):
+    """해외주식 잔고 조회. ovrs_excg_cd: NASD(미국전체)/NYSE/AMEX 등."""
     url = f"{BASE_URL}/uapi/overseas-stock/v1/trading/inquire-balance"
     params = {
         "CANO": CANO,
@@ -84,55 +97,99 @@ def fetch_overseas(token, ovrs_excg_cd="ALL", tr_crcy_cd="USD"):
         raise RuntimeError(f"해외주식 조회 실패: [{data.get('msg_cd')}] {data.get('msg1', '').strip()}")
     return data
 
-if __name__ == "__main__":
-    print(f"KIS Developers API 연결 중... (환경: {'모의투자' if IS_MOCK else '실전투자'})")
-
+def get_merged_portfolio():
+    """국내/해외 계좌 잔고를 병합하여 한화 평가금액 기준으로 반환"""
     token = get_token()
-
-    # 국내주식
-    print("\n[국내주식] 조회 중...")
+    
+    # 1. 국내주식 조회
     d_data = fetch_domestic(token)
-    raw_d1 = d_data.get("output1", [])
-    d_stocks = raw_d1 if isinstance(raw_d1, list) else ([raw_d1] if isinstance(raw_d1, dict) else [])
-    raw_d2 = d_data.get("output2", {})
-    d_summary = raw_d2[0] if isinstance(raw_d2, list) else (raw_d2 if isinstance(raw_d2, dict) else {})
+    d_stocks_raw = d_data.get("output1", [])
+    d_stocks = d_stocks_raw if isinstance(d_stocks_raw, list) else ([d_stocks_raw] if isinstance(d_stocks_raw, dict) else [])
+    d_summary = d_data.get("output2", {})
+    if isinstance(d_summary, list): d_summary = d_summary[0] if d_summary else {}
 
-    total_domestic_eval = 0
+    # 2. 해외주식 조회 및 환율 적용 (yfinance 활용)
+    exchange_rate = get_exchange_rate("USD")
+    o_data = fetch_overseas(token, "NASD", "USD")
+    o_stocks_raw = o_data.get("output1", [])
+    o_stocks = o_stocks_raw if isinstance(o_stocks_raw, list) else ([o_stocks_raw] if isinstance(o_stocks_raw, dict) else [])
+    o_summary = o_data.get("output2", {})
+    if isinstance(o_summary, list): o_summary = o_summary[0] if o_summary else {}
+
+    # 3. 데이터 정규화 및 병합
+    portfolio = []
+    total_eval_krw = 0
+
+    # 국내 주식 추가
     for s in d_stocks:
         qty = int(s.get("hldg_qty", 0))
         if qty > 0:
-            name = s.get("prdt_name")
             price = int(float(s.get("prpr", 0)))
-            total_domestic_eval += qty * price
-            print(f"  -> {name}: {qty}주 ({price:,}원)")
+            eval_amt = qty * price
+            total_eval_krw += eval_amt
+            portfolio.append({
+                "type": "국내",
+                "name": s.get("prdt_name"),
+                "code": s.get("pdno"),
+                "qty": qty,
+                "price": price,
+                "currency": "KRW",
+                "eval_amt": eval_amt,
+                "profit_loss": int(float(s.get("evlu_pfls_amt", 0)))
+            })
 
-    # 해외주식 (미국 전체, NASD)
-    print("\n[해외주식] 조회 중...")
+    # 해외 주식 추가 (한화 변환)
+    for s in o_stocks:
+        qty = int(s.get("ovrs_cblc_qty", 0))
+        if qty > 0:
+            price_usd = float(s.get("ovrs_now_pric", 0))
+            price_krw = int(price_usd * exchange_rate)
+            eval_amt = qty * price_krw
+            total_eval_krw += eval_amt
+            portfolio.append({
+                "type": "해외(미국)",
+                "name": s.get("ovrs_item_name") or s.get("ovrs_pdno"),
+                "code": s.get("ovrs_pdno"),
+                "qty": qty,
+                "price": price_usd,
+                "price_krw": price_krw,
+                "currency": "USD",
+                "eval_amt": eval_amt,
+                "profit_loss": int(float(s.get("evlu_pfls_amt", 0)) * exchange_rate)
+            })
+
+    # 4. 요약 정보 구성
+    cash_krw = int(float(d_summary.get("prvs_rcdl_excc_amt", 0)))
+    
+    summary = {
+        "cash": cash_krw,
+        "stock_eval": total_eval_krw,
+        "total_assets": cash_krw + total_eval_krw,
+        "exchange_rate_usd": exchange_rate,
+        "holdings": portfolio
+    }
+    
+    return summary
+
+if __name__ == "__main__":
+    print(f"KIS Developers API 병합 조회 중... (환경: {'모의투자' if IS_MOCK else '실전투자'})")
     try:
-        o_data = fetch_overseas(token, ovrs_excg_cd="NASD", tr_crcy_cd="USD")
-        raw_o1 = o_data.get("output1", [])
-        o_stocks = raw_o1 if isinstance(raw_o1, list) else ([raw_o1] if isinstance(raw_o1, dict) else [])
-        if not o_stocks:
-            print("  (보유 해외주식 없음)")
-        else:
-            for s in o_stocks:
-                qty = int(s.get("ovrs_cblc_qty", 0))
-                if qty > 0:
-                    name = s.get("ovrs_pdno")
-                    price = s.get("ovrs_now_pric", "0")
-                    print(f"  -> {name}: {qty}주 ({price} USD)")
+        result = get_merged_portfolio()
+        
+        print(f"\n💱 적용 환율: {result['exchange_rate_usd']:,.2f} 원/USD")
+        print(f"💰 주문가능현금: {result['cash']:,} 원")
+        print(f"📈 주식 평가금액: {result['stock_eval']:,} 원")
+        print(f"💎 총 자산 규모: {result['total_assets']:,} 원")
+        
+        print(f"\n📋 [보유 종목 상세]")
+        print(f"{'구분':<10} | {'종목명':<20} | {'수량':<8} | {'단가':<15} | {'평가금액':<15} | {'손익':<15}")
+        print("-" * 100)
+        for h in result['holdings']:
+            if h['currency'] == 'USD':
+                price_str = f"${h['price']:,.2f} ({h['price_krw']:,}원)"
+            else:
+                price_str = f"{h['price']:,}원"
+            print(f"{h['type']:<10} | {h['name']:<20} | {h['qty']:<8} | {price_str:<15} | {h['eval_amt']:<15,} | {h['profit_loss']:<15,}")
+            
     except RuntimeError as e:
-        print(f"  [경고] {e}")
-
-    # 계좌 요약
-    print("\n[계좌 요약]")
-    cash = d_summary.get("prvs_rcdl_excc_amt", d_summary.get("ord_psbl_cash", "0"))
-    try:
-        cash_val = int(float(cash))
-    except Exception:
-        cash_val = 0
-    tot_eval = int(float(d_summary.get("tot_evlu_amt", 0)))
-    print(f"  -> 주문가능현금:  {cash_val:,}원")
-    print(f"  -> 국내 평가금액: {total_domestic_eval:,}원")
-    if tot_eval:
-        print(f"  -> 계좌 총 평가: {tot_eval:,}원")
+        print(f"❌ 오류 발생: {e}")
