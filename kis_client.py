@@ -10,83 +10,125 @@ CANO = os.getenv('CANO')
 ACNT_PRDT_CD = os.getenv('ACNT_PRDT_CD', '01')
 IS_MOCK = os.getenv('IS_MOCK', 'true').lower() == 'true'
 
-# 모의투자/실전투자 도메인 구분
-BASE_URL = "https://openapivts.koreainvestment.com:29443" if IS_MOCK else "https://openapi.koreainvestment.com:9443"
+# 모의/실전 도메인 및 TR_ID 구분
+if IS_MOCK:
+    BASE_URL = "https://openapivts.koreainvestment.com:29443"
+    DOMESTIC_TR_ID = "VTTC8434R"
+    OVERSEAS_TR_ID = "VTRN3018R"
+else:
+    BASE_URL = "https://openapi.koreainvestment.com:9443"
+    DOMESTIC_TR_ID = "TTTC8434R"
+    OVERSEAS_TR_ID = "JTTN3018R"
 
-def get_access_token():
-    """Access Token 발급"""
-    url = f"{BASE_URL}/oauth2/tokenP"
+def get_token():
+    path = "/oauth2/tokenP"
+    url = f"{BASE_URL}{path}"
     headers = {"content-type": "application/json"}
     body = {
         "grant_type": "client_credentials",
         "appkey": APP_KEY,
-        "appsecret": APP_SECRET
+        "appsecret": APP_SECRET,
     }
     res = requests.post(url, headers=headers, json=body)
-    return res.json().get("access_token")
+    res_json = res.json()
+    if "access_token" not in res_json:
+        raise RuntimeError(f"토큰 발급 실패: {res_json}")
+    return res_json["access_token"]
 
-def get_balance():
-    """계좌 잔고 및 보유 종목 조회"""
-    token = get_access_token()
-    url = f"{BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
-    
-    headers = {
+def _base_headers(token, tr_id):
+    return {
+        "content-type": "application/json",
         "authorization": f"Bearer {token}",
         "appkey": APP_KEY,
         "appsecret": APP_SECRET,
-        "tr_id": "TTTC8434R"
+        "tr_id": tr_id,
     }
-    
-    # 국내주식 계좌잔고 조회 API 파라미터
+
+def fetch_domestic(token):
+    url = f"{BASE_URL}/uapi/domestic-stock/v1/trading/inquire-balance"
     params = {
         "CANO": CANO,
         "ACNT_PRDT_CD": ACNT_PRDT_CD,
-        "AFHR_FLPR_YN": "N",      # 시간외단가단위여부
-        "UND_FLTR_YN": "N",       # 미포함종목여부 (N: 전체)
-        "INQR_DVSN": "00",        # 조회구분 (00: 전체)
-        "UNPR_DVSN": "01",        # 단가구분
-        "FUND_STTL_ICLD_YN": "F", # 펀드결제분포함여부
+        "AFHR_FLPR_YN": "N",
+        "OFL_YN": "",
+        "INQR_DVSN": "02",
+        "UNPR_DVSN": "01",
+        "FUND_STTL_ICLD_YN": "N",
         "FNCG_AMT_AUTO_RDPT_YN": "N",
-        "PRCS_DVSN": "00",        # 처리구분 (00: 전량)
-        "CTX_AREA_K1": "",        # 연속조회검색조건
-        "CTX_AREA_K2": ""         # 연속조회키
+        "PRCS_DVSN": "01",
+        "CTX_AREA_FK100": "",
+        "CTX_AREA_NK100": "",
     }
-    
-    res = requests.get(url, headers=headers, params=params)
+    res = requests.get(url, headers=_base_headers(token, DOMESTIC_TR_ID), params=params)
     data = res.json()
-    
-    # 응답 구조: output1 (종목별 정보), output2 (요약 정보)
-    stocks = data.get("output1", [])
-    summary = data.get("output2", {})
-    
-    return stocks, summary
+    if data.get("rt_cd") != "0":
+        raise RuntimeError(f"국내주식 조회 실패: [{data.get('msg_cd')}] {data.get('msg1', '').strip()}")
+    return data
+
+def fetch_overseas(token, ovrs_excg_cd="NASD", tr_crcy_cd="USD"):
+    """해외주식 잔고 조회. ovrs_excg_cd: NASD/NYSE/AMEX/TKSE/SEHK 등"""
+    url = f"{BASE_URL}/uapi/overseas-stock/v1/trading/inquire-balance"
+    params = {
+        "CANO": CANO,
+        "ACNT_PRDT_CD": ACNT_PRDT_CD,
+        "OVRS_EXCG_CD": ovrs_excg_cd,
+        "TR_CRCY_CD": tr_crcy_cd,
+        "CTX_AREA_FK200": "",
+        "CTX_AREA_NK200": "",
+    }
+    res = requests.get(url, headers=_base_headers(token, OVERSEAS_TR_ID), params=params)
+    data = res.json()
+    if data.get("rt_cd") != "0":
+        raise RuntimeError(f"해외주식 조회 실패: [{data.get('msg_cd')}] {data.get('msg1', '').strip()}")
+    return data
 
 if __name__ == "__main__":
+    print(f"KIS Developers API 연결 중... (환경: {'모의투자' if IS_MOCK else '실전투자'})")
+
+    token = get_token()
+
+    # 국내주식
+    print("\n[국내주식] 조회 중...")
+    d_data = fetch_domestic(token)
+    raw_d1 = d_data.get("output1", [])
+    d_stocks = raw_d1 if isinstance(raw_d1, list) else ([raw_d1] if isinstance(raw_d1, dict) else [])
+    raw_d2 = d_data.get("output2", {})
+    d_summary = raw_d2[0] if isinstance(raw_d2, list) else (raw_d2 if isinstance(raw_d2, dict) else {})
+
+    total_domestic_eval = 0
+    for s in d_stocks:
+        qty = int(s.get("hldg_qty", 0))
+        if qty > 0:
+            name = s.get("prdt_name")
+            price = int(float(s.get("prpr", 0)))
+            total_domestic_eval += qty * price
+            print(f"  -> {name}: {qty}주 ({price:,}원)")
+
+    # 해외주식
+    print("\n[해외주식] 조회 중...")
     try:
-        my_stocks, my_summary = get_balance()
-        
-        # 1. 보유 종목 상세 내역
-        print("\n========== 📊 보유 종목 현황 ==========")
-        total_eval = 0
-        for stock in my_stocks:
-            name = stock.get('prdt_name', 'N/A')
-            qty = int(stock.get('bldg_qty', 0))
-            avg_price = int(float(stock.get('pchs_avg_pric', 0)))
-            curr_price = int(float(stock.get('prpr', 0))) # 현재가
-            eval_amt = qty * curr_price
-            total_eval += eval_amt
-            
-            print(f"[{name}]")
-            print(f"  ↳ 수량: {qty:,}주 | 평균가: {avg_price:,}원 | 현재가: {curr_price:,}원")
-            print(f"  ↳ 평가금액: {eval_amt:,}원 | 평가손익: {eval_amt - (qty * avg_price):,}원")
-        
-        # 2. 현금 및 총자산 요약
-        print("\n========== 💰 계좌 요약 ==========")
-        print(f"💵 주문가능현금: {int(my_summary.get('ord_psbl_cash', 0)):,}원")
-        print(f"📈 총평가금액: {total_eval:,}원")
-        print(f"🏦 총자산(eval+cash): {total_eval + int(my_summary.get('ord_psbl_cash', 0)):,}원")
-        print("=====================================")
-        
-    except Exception as e:
-        print(f"❌ 오류 발생: {e}")
-        print("💡 .env 파일의 APP_KEY, APP_SECRET, 계좌번호를 확인해주세요.")
+        o_data = fetch_overseas(token)
+        raw_o1 = o_data.get("output1", [])
+        o_stocks = raw_o1 if isinstance(raw_o1, list) else ([raw_o1] if isinstance(raw_o1, dict) else [])
+        for s in o_stocks:
+            qty = int(s.get("ovrs_cblc_qty", 0))
+            if qty > 0:
+                name = s.get("ovrs_pdno")
+                print(f"  -> {name}: {qty}주")
+        if not o_stocks:
+            print("  (보유 해외주식 없음)")
+    except RuntimeError as e:
+        print(f"  [경고] {e}")
+
+    # 계좌 요약
+    print("\n[계좌 요약]")
+    cash = d_summary.get("prvs_rcdl_excc_amt", d_summary.get("ord_psbl_cash", "0"))
+    try:
+        cash_val = int(float(cash))
+    except Exception:
+        cash_val = 0
+    tot_eval = int(float(d_summary.get("tot_evlu_amt", 0)))
+    print(f"  -> 주문가능현금:  {cash_val:,}원")
+    print(f"  -> 국내 평가금액: {total_domestic_eval:,}원")
+    if tot_eval:
+        print(f"  -> 계좌 총 평가: {tot_eval:,}원")
