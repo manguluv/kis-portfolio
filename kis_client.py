@@ -138,24 +138,43 @@ def get_merged_portfolio():
                 "profit_loss": int(float(s.get("evlu_pfls_amt", 0)))
             })
 
-    # 해외 주식 추가 (한화 변환)
+    # 해외 주식 추가 (한화 변환) - 시세가 없을 경우 yfinance로 보완
     for s in o_stocks:
         qty = int(s.get("ovrs_cblc_qty", 0))
         if qty > 0:
+            code = s.get("ovrs_pdno")
             price_usd = float(s.get("ovrs_now_pric", 0))
+            
+            # API에서 현재가가 0일 경우 yfinance로 실시간 가격 조회
+            if price_usd == 0:
+                try:
+                    ticker = yf.Ticker(code)
+                    price_usd = float(ticker.history(period="1d")['Close'].iloc[-1])
+                except Exception:
+                    price_usd = 0
+
             price_krw = int(price_usd * exchange_rate)
             eval_amt = qty * price_krw
             total_eval_krw += eval_amt
+            
+            # API에서 제공하는 평가손익이 있으면 환율 적용, 없으면 yfinance 기반 단순 계산
+            profit_loss_usd = float(s.get("evlu_pfls_amt", 0))
+            if profit_loss_usd != 0:
+                profit_loss_krw = int(profit_loss_usd * exchange_rate)
+            else:
+                pchs_avg = float(s.get("pchs_avg_pric", 0))
+                profit_loss_krw = int((price_usd - pchs_avg) * qty * exchange_rate)
+
             portfolio.append({
                 "type": "해외(미국)",
-                "name": s.get("ovrs_item_name") or s.get("ovrs_pdno"),
-                "code": s.get("ovrs_pdno"),
+                "name": s.get("ovrs_item_name") or code,
+                "code": code,
                 "qty": qty,
                 "price": price_usd,
                 "price_krw": price_krw,
                 "currency": "USD",
                 "eval_amt": eval_amt,
-                "profit_loss": int(float(s.get("evlu_pfls_amt", 0)) * exchange_rate)
+                "profit_loss": profit_loss_krw
             })
 
     # 4. 요약 정보 구성
