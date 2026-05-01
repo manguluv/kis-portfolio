@@ -18,7 +18,7 @@ if IS_MOCK:
 else:
     BASE_URL = "https://openapi.koreainvestment.com:9443"
     DOMESTIC_TR_ID = "TTTC8434R"
-    OVERSEAS_TR_ID = "JTTN3018R"
+    OVERSEAS_TR_ID = "TTTS3012R"
 
 def get_token():
     path = "/oauth2/tokenP"
@@ -65,14 +65,16 @@ def fetch_domestic(token):
         raise RuntimeError(f"국내주식 조회 실패: [{data.get('msg_cd')}] {data.get('msg1', '').strip()}")
     return data
 
-def fetch_overseas(token, ovrs_excg_cd="NASD", tr_crcy_cd="USD"):
-    """해외주식 잔고 조회. ovrs_excg_cd: NASD/NYSE/AMEX/TKSE/SEHK 등"""
+def fetch_overseas(token, ovrs_excg_cd="ALL", tr_crcy_cd="USD"):
+    """해외주식 잔고 조회. ovrs_excg_cd: NASD(미국전체)/NYSE/AMEX 등. ALL일 경우 전체 조회."""
     url = f"{BASE_URL}/uapi/overseas-stock/v1/trading/inquire-balance"
     params = {
         "CANO": CANO,
         "ACNT_PRDT_CD": ACNT_PRDT_CD,
         "OVRS_EXCG_CD": ovrs_excg_cd,
         "TR_CRCY_CD": tr_crcy_cd,
+        "OVRS_ICLD_EXRS_YN": "N",
+        "PRCS_DVSN": "01",
         "CTX_AREA_FK200": "",
         "CTX_AREA_NK200": "",
     }
@@ -104,19 +106,21 @@ if __name__ == "__main__":
             total_domestic_eval += qty * price
             print(f"  -> {name}: {qty}주 ({price:,}원)")
 
-    # 해외주식
+    # 해외주식 (미국 전체, NASD)
     print("\n[해외주식] 조회 중...")
     try:
-        o_data = fetch_overseas(token)
+        o_data = fetch_overseas(token, ovrs_excg_cd="NASD", tr_crcy_cd="USD")
         raw_o1 = o_data.get("output1", [])
         o_stocks = raw_o1 if isinstance(raw_o1, list) else ([raw_o1] if isinstance(raw_o1, dict) else [])
-        for s in o_stocks:
-            qty = int(s.get("ovrs_cblc_qty", 0))
-            if qty > 0:
-                name = s.get("ovrs_pdno")
-                print(f"  -> {name}: {qty}주")
         if not o_stocks:
             print("  (보유 해외주식 없음)")
+        else:
+            for s in o_stocks:
+                qty = int(s.get("ovrs_cblc_qty", 0))
+                if qty > 0:
+                    name = s.get("ovrs_pdno")
+                    price = s.get("ovrs_now_pric", "0")
+                    print(f"  -> {name}: {qty}주 ({price} USD)")
     except RuntimeError as e:
         print(f"  [경고] {e}")
 
